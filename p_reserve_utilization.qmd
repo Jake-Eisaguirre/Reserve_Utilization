@@ -1,0 +1,590 @@
+---
+title: "p_reserve_utilization"
+format: html
+editor: source
+---
+
+### Packages
+```{r}
+
+if (!require(librarian)){
+  install.packages("librarian")
+  library(librarian)
+}
+
+# librarian downloads, if not already downloaded, and reads in needed packages
+librarian::shelf(tidyverse, here, DBI, odbc, scales, padr)
+
+
+
+raw_date <- Sys.Date()
+
+previous_bid_period <- substr(as.character((raw_date - 30)), 1, 7)
+
+update_dt_scr <- paste0(substr(as.character((raw_date - 60)), 1, 7), "-28 00:00:00")
+
+previous_bid_period <- "2024-07"
+
+```
+
+### Connect to `ENTERPRISE` Database
+```{r}
+
+tryCatch({
+    db_connection <- DBI::dbConnect(odbc::odbc(),
+                             Driver="SnowflakeDSIIDriver",
+                             Server="hawaiianair.west-us-2.azure.snowflakecomputing.com",
+                             WAREHOUSE="DATA_LAKE_READER",
+                             Database="ENTERPRISE",
+                             UID= Sys.getenv("UID"), # <- remove "Sys.getenv("UID")" and enter "your email"
+                             authenticator = "externalbrowser")
+    print("Database Connected!")
+    },
+    error=function(cond) {
+            print("Unable to connect to Database.")
+})
+
+
+
+
+# Set search_path
+dbExecute(db_connection, "USE SCHEMA CREW_ANALYTICS")
+
+```
+### `AA_FINAL_PAIRING`
+```{r}
+
+### Connect to `PLAYGROUND` Database
+tryCatch({
+    db_connection_pg <- DBI::dbConnect(odbc::odbc(),
+                             Driver="SnowflakeDSIIDriver",
+                             Server="hawaiianair.west-us-2.azure.snowflakecomputing.com",
+                             WAREHOUSE="DATA_LAKE_READER",
+                             Database="PLAYGROUND",
+                             UID= Sys.getenv("UID"), 
+                             authenticator = "externalbrowser")
+    print("Database Connected!")
+    },
+    error=function(cond) {
+            print("Unable to connect to Database.")
+})
+
+
+# Set search_path
+dbExecute(db_connection_pg, "USE SCHEMA CREW_ANALYTICS")
+
+q_final_pairing <- "select CREW_ID, PAIRING_NO, PAIRING_DATE, FLIGHT_DATE, EQUIPMENT, PAIRING_POSITION,
+                    DEPARTING_CITY, ARRIVAL_CITY, SCHED_DEPARTURE_TIME, SCHED_ARRIVAL_TIME
+                    from AA_FINAL_PAIRING WHERE PAIRING_DATE BETWEEN '2019-01-01' AND '2024-08-01';"
+
+final_pairing_raw <- dbGetQuery(db_connection_pg, q_final_pairing) 
+
+
+```
+
+### `CT_MASTER_HISTORY`
+```{r}
+
+q_master_history <- paste0("select * from CT_MASTER_HISTORY WHERE BID_PERIOD ='",previous_bid_period, "';")
+
+
+master_history_raw <- dbGetQuery(db_connection, q_master_history)
+
+
+
+pilot_trx_hist <- master_history_raw %>% 
+  filter(CREW_INDICATOR == "P") %>% 
+  mutate(update_dt = paste(UPDATE_DATE, UPDATE_TIME, sep = " ")) %>% 
+  group_by(CREW_ID, PAIRING_DATE, TRANSACTION_CODE) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  select(!temp_id) %>% 
+  ungroup() %>% 
+  group_by(CREW_ID, PAIRING_DATE) %>% 
+  mutate(keep = ifelse(any(TRANSACTION_CODE %in% c("SCR", "ASN", "RSV", "ARC", "RLV")), 1, 0)) %>% 
+  filter(keep == 1)
+
+  
+
+
+
+
+  
+
+```
+
+
+### Pilot UT
+```{r}
+
+pilot_ut_scr <- master_history_raw %>% 
+  ungroup() %>% 
+  filter(CREW_INDICATOR == "P") %>% 
+  filter(TRANSACTION_CODE %in% c("ARC", "SCR", "ASN")) %>% 
+  mutate(update_dt = paste(UPDATE_DATE, UPDATE_TIME, sep = " ")) %>%
+  group_by(CREW_ID, PAIRING_DATE, TRANSACTION_CODE) %>%
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  ungroup() %>% 
+  select(CREW_INDICATOR, CREW_ID, TRANSACTION_CODE, PAIRING_NO,
+         PAIRING_DATE, TO_DATE, PAIRING_POSITION, BID_PERIOD, BASE)
+
+pilot_ut_asn <- master_history_raw %>% 
+  ungroup() %>% 
+  filter(CREW_INDICATOR == "P") %>% 
+  filter(TRANSACTION_CODE %in% c("ARC", "SCR", "ASN")) %>% 
+  mutate(update_dt = paste(UPDATE_DATE, UPDATE_TIME, sep = " ")) %>%
+  group_by(CREW_ID, PAIRING_DATE, TRANSACTION_CODE) %>%
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  ungroup() %>% 
+  select(CREW_INDICATOR, CREW_ID, TRANSACTION_CODE, PAIRING_NO,
+         PAIRING_DATE, TO_DATE, PAIRING_POSITION, BID_PERIOD, BASE)
+
+
+# ,
+#          update_dt < update_dt_scr
+
+```
+
+
+
+### Pilot aircraft rating
+```{r}
+q_master_sched <- "select CREW_ID, EFFECTIVE_FROM_DATE, EFFECTIVE_TO_DATE, EQUIPMENT, PAIRING_POSITION, BID_DATE,
+                   UPDATE_DATE, UPDATE_TIME, BASE, BID_TYPE
+                   from CT_MASTER_SCHEDULE WHERE BID_DATE > '2018-12';"
+
+raw_ms <- dbGetQuery(db_connection, q_master_sched)
+
+clean_ms <- raw_ms %>% 
+  mutate(update_dt = paste(UPDATE_DATE, UPDATE_TIME, sep = " ")) %>% 
+  group_by(CREW_ID, EFFECTIVE_FROM_DATE, EFFECTIVE_TO_DATE, PAIRING_POSITION) %>% 
+  filter(update_dt == max(update_dt)) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  rename(BID_PERIOD = BID_DATE) %>% 
+  ungroup() %>% 
+  select(CREW_ID, BID_PERIOD, PAIRING_POSITION, EQUIPMENT, BASE, BID_TYPE) %>% 
+  rename(trained_equipment = EQUIPMENT)
+
+```
+
+
+### Fleet Pilot History 
+```{r}
+
+emp_hist_p_asn <-  pilot_ut_asn %>% 
+  #left_join(final_pairing_raw, by = c("CREW_ID", "PAIRING_DATE", "PAIRING_NO", "PAIRING_POSITION")) %>% 
+  inner_join(clean_ms, by = c("CREW_ID", "BID_PERIOD", "PAIRING_POSITION", "BASE")) %>% 
+  #mutate(remove = if_else(TRANSACTION_CODE == "ASN" & is.na(FLIGHT_DATE),
+                              # 1, 0)) %>% 
+  #filter(!remove == 1) %>% 
+  #select(!remove) %>% 
+  filter(PAIRING_POSITION %in% c("CA", "FO")) 
+
+emp_hist_p_scr <-  pilot_ut_scr %>% 
+  #left_join(final_pairing_raw, by = c("CREW_ID", "PAIRING_DATE", "PAIRING_NO", "PAIRING_POSITION")) %>% 
+  inner_join(clean_ms, by = c("CREW_ID", "BID_PERIOD", "PAIRING_POSITION", "BASE")) %>% 
+  #mutate(remove = if_else(TRANSACTION_CODE == "ASN" & is.na(FLIGHT_DATE),
+                              # 1, 0)) %>% 
+  #filter(!remove == 1) %>% 
+  #select(!remove) %>% 
+  filter(PAIRING_POSITION %in% c("CA", "FO")) 
+
+```
+
+
+
+
+# Daily CA Utilization
+```{r}
+
+
+# piv_emp_hist_ca <- emp_hist_p %>% 
+#   filter(BID_PERIOD == "2024-07",
+#          TRANSACTION_CODE %in% c("SCR", "ASN", "ARC"),
+#          PAIRING_POSITION == "CA") %>% 
+#   pivot_longer(cols = c("PAIRING_DATE", "TO_DATE"),
+#                values_to = "DATE") %>% 
+#   group_by(CREW_ID, trained_equipment, TRANSACTION_CODE, DATE) %>% 
+#   mutate(temp_id = cur_group_id()) %>% 
+#   filter(!duplicated(temp_id)) %>% 
+#   ungroup() %>% 
+#   mutate(PAIRING_NO = if_else(PAIRING_NO == "SCR", NA, PAIRING_NO)) 
+
+asn_ca_double <- emp_hist_p_asn %>%
+  filter(TRANSACTION_CODE %in% c("ASN"),
+         PAIRING_POSITION == "CA") %>% 
+  mutate(single = if_else(PAIRING_DATE == TO_DATE, 1, 0)) %>% 
+  filter(single == 0) %>% 
+  pivot_longer(cols = c("PAIRING_DATE", "TO_DATE"),
+               values_to = "DATE") %>% 
+  group_by(CREW_ID, trained_equipment, TRANSACTION_CODE, DATE) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  ungroup() %>% 
+  group_by(CREW_ID, TRANSACTION_CODE, trained_equipment, PAIRING_NO) %>% 
+  pad(by='DATE') %>% 
+  ungroup()
+
+asn_ca_single <- emp_hist_p_asn %>%
+  filter(TRANSACTION_CODE %in% c("ASN"),
+         PAIRING_POSITION == "CA") %>% 
+  mutate(single = if_else(PAIRING_DATE == TO_DATE, 1, 0)) %>% 
+  filter(single == 1) %>% 
+  pivot_longer(cols = c("PAIRING_DATE", "TO_DATE"),
+               values_to = "DATE") %>% 
+  group_by(CREW_ID, trained_equipment, TRANSACTION_CODE, DATE) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  ungroup()
+
+asn_ca <- rbind(asn_ca_single, asn_ca_double) %>% 
+  group_by(DATE, trained_equipment) %>% 
+  mutate(scr_used = n()) %>% 
+  ungroup() %>% 
+  select(DATE, trained_equipment, scr_used)
+  
+
+scr_ca <- emp_hist_p_scr %>% 
+  filter(TRANSACTION_CODE %in%  c("SCR", "ARC")) %>% 
+  rename(DATE = PAIRING_DATE) %>% 
+  group_by(DATE, trained_equipment) %>% 
+  mutate(net_scr_available = length(unique(CREW_ID))) %>% 
+  ungroup()%>% 
+  select(DATE, trained_equipment, net_scr_available)
+
+comb_ca <- left_join(scr_ca, asn_ca) %>% 
+  group_by(DATE, trained_equipment) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  select(!temp_id) %>% 
+  mutate(scr_used = if_else(is.na(scr_used), 0, scr_used)) %>% 
+  mutate(scr_remaining = net_scr_available - scr_used) %>% 
+  mutate(scr_remaining = if_else(scr_remaining < 0,0, scr_remaining)) %>% 
+  filter(!trained_equipment == "33Y")
+```
+### Daily CA
+``` {r}
+# Reshape data to long format
+long_data_ca <- comb_ca %>%
+  select(DATE, trained_equipment, scr_used, scr_remaining) %>%
+  pivot_longer(cols = c(scr_used, scr_remaining), 
+               names_to = "scr_type", 
+               values_to = "Head_Count") %>% 
+  mutate(scr_type=if_else(scr_type == "scr_remaining", "SCR/ACR Available", "SCR/ACR Utilized"))
+
+label_data_ca <- comb_ca %>%
+  select(DATE, trained_equipment, net_scr_available)
+
+label_data_ca_used <- comb_ca %>%
+  select(DATE, trained_equipment, scr_used)
+
+# Plot
+ggplot(comb_ca) +
+  facet_wrap(~trained_equipment, scales = "free_y") +
+  geom_bar(aes(x = DATE, y = net_scr_available, fill = "net_rlv_available"),
+           stat = "identity", alpha = 0.3) +
+  geom_bar(data = long_data_ca, 
+           aes(x = DATE, y = Head_Count, fill = scr_type), 
+           stat = "identity", position = "stack") +
+  scale_x_date(date_labels = "%Y-%m-%d", date_breaks = "3 days") +
+  scale_fill_manual(values = c(  
+                                "SCR/ACR Available" = "#413691", 
+                                "SCR/ACR Utilized" = "#D2058A")) +
+  labs(x = "Date", y = "SCR/ACR Head Count", fill = "SCR/ACR Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.text = element_text(size = 6),  # Adjust legend text size
+        legend.key.size = unit(0.25, "cm"),  # Adjust size of legend keys
+        legend.title = element_text(size = 5),  # Adjust legend title size
+        legend.box.spacing = unit(0.25, "cm"),  # Adjust spacing around the legend box
+        plot.title = element_text(hjust = 0.5)  # Center the title
+        ) +
+  ggtitle("CA") +
+  geom_text(data = label_data_ca,
+            aes(x = DATE, y = net_scr_available, label = net_scr_available),
+            size = 1.9, vjust = -0.5)+
+  geom_text(data = label_data_ca_used,
+            aes(x = DATE, y = scr_used, label = scr_used),
+            size = 1.9, vjust = -0.5, color = "white")
+
+```
+# Daily fO Utilization
+```{r}
+
+
+piv_emp_hist_fo <- emp_hist_p %>% 
+  filter(BID_PERIOD == "2024-08",
+         TRANSACTION_CODE %in% c("SCR", "ASN", "ARC"),
+         PAIRING_POSITION == "FO") %>% 
+  pivot_longer(cols = c("PAIRING_DATE", "TO_DATE"),
+               values_to = "DATE") %>% 
+  group_by(CREW_ID, trained_equipment, TRANSACTION_CODE, DATE) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  ungroup() %>% 
+  mutate(PAIRING_NO = if_else(PAIRING_NO == "SCR", NA, PAIRING_NO)) 
+
+asn_fo <- piv_emp_hist_fo %>%
+  filter(TRANSACTION_CODE == "ASN") %>% 
+  group_by(CREW_ID, TRANSACTION_CODE, trained_equipment, PAIRING_NO) %>% 
+  pad(by='DATE') %>% 
+  ungroup() %>% 
+  group_by(DATE, trained_equipment) %>% 
+  mutate(scr_used = n()) %>% 
+  ungroup() %>% 
+  select(DATE, trained_equipment, scr_used)
+
+scr_fo <- piv_emp_hist_fo %>% 
+  filter(TRANSACTION_CODE %in% c("SCR", "ARC")) %>% 
+  group_by(DATE, trained_equipment) %>% 
+  mutate(net_scr_available = length(unique(CREW_ID))) %>% 
+  ungroup()%>% 
+  select(DATE, trained_equipment, net_scr_available)
+
+comb_fo <- left_join(scr_fo, asn_fo) %>% 
+  group_by(DATE, trained_equipment) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  select(!temp_id) %>% 
+  mutate(scr_used = if_else(is.na(scr_used), 0, scr_used)) %>% 
+  mutate(scr_remaining = net_scr_available - scr_used)%>% 
+  mutate(scr_remaining = if_else(scr_remaining < 0,0, scr_remaining))
+```
+### Daily FO
+``` {r}
+# Reshape data to long format
+long_data_fo <- comb_fo %>%
+  ungroup() %>% 
+  select(DATE, trained_equipment, scr_used, scr_remaining) %>%
+  pivot_longer(cols = c(scr_used, scr_remaining), 
+               names_to = "scr_type", 
+               values_to = "Head_Count") %>% 
+  mutate(scr_type=if_else(scr_type == "scr_remaining", "SCR/ACR Available", "SCR/ACR Utilized"))
+
+label_data_fo <- comb_fo %>%
+  select(DATE, trained_equipment, net_scr_available)
+
+label_data_fo_used <- comb_fo %>%
+  select(DATE, trained_equipment, scr_used)
+
+# Plot
+ggplot(comb_fo) +
+  facet_wrap(~trained_equipment, scales = "free_y") +
+  geom_bar(aes(x = DATE, y = net_scr_available, fill = "net_rlv_available"),
+           stat = "identity", alpha = 0.3) +
+  geom_bar(data = long_data_fo, 
+           aes(x = DATE, y = Head_Count, fill = scr_type), 
+           stat = "identity", position = "stack") +
+  scale_x_date(date_labels = "%Y-%m-%d", date_breaks = "3 days") +
+  scale_fill_manual(values = c( 
+                                "SCR/ACR Available" = "#413691", 
+                                "SCR/ACR Utilized" = "#D2058A")) +
+  labs(x = "Date", y = "SCR/ACR Head Count", fill = "SCR Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.text = element_text(size = 5),  # Adjust legend text size
+        legend.key.size = unit(0.20, "cm"),  # Adjust size of legend keys
+        legend.title = element_text(size = 5),  # Adjust legend title size
+        legend.box.spacing = unit(0.20, "cm"),  # Adjust spacing around the legend box
+        plot.title = element_text(hjust = 0.5)  # Center the title
+        ) +
+  ggtitle("FO") +
+  geom_text(data = label_data_fo,
+            aes(x = DATE, y = net_scr_available, label = net_scr_available),
+            size = 1.9, vjust = -0.5)+
+  geom_text(data = label_data_fo_used,
+            aes(x = DATE, y = scr_used, label = scr_used),
+            size = 1.9, vjust = -0.5, color = "white")
+
+```
+
+
+
+### OLD OLD
+
+
+
+
+
+### Remove legs to get counts per day
+```{r}
+#20967
+
+emp_hist_no_legs_p <- emp_hist_p %>% 
+  group_by(CREW_ID, PAIRING_NO, FLIGHT_DATE, PAIRING_DATE) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  select(!c(temp_id, DEPARTING_CITY, ARRIVAL_CITY, SCHED_DEPARTURE_TIME, SCHED_ARRIVAL_TIME)) %>% 
+  ungroup()
+
+
+t_p <- emp_hist_no_legs_p %>% 
+  #filter(CREW_ID == "14473") %>% 
+  group_by(CREW_ID, TRANSACTION_CODE, PAIRING_NO, PAIRING_DATE)
+
+filtered_data_p <- t_p %>%
+  filter(!is.na(FLIGHT_DATE))
+
+# Step 2: Perform complete operations on the filtered data
+completed_data_p <- filtered_data_p %>%
+  group_by(CREW_ID, TRANSACTION_CODE, PAIRING_NO, PAIRING_DATE) %>%
+  complete(FLIGHT_DATE = seq(min(FLIGHT_DATE, na.rm = TRUE), 
+                             max(FLIGHT_DATE, na.rm = TRUE), 
+                             by = "day")) %>%
+  fill(everything(), .direction = "down") %>%
+  ungroup()
+
+not_needed_complete_data_p <- t_p %>% 
+  filter(is.na(FLIGHT_DATE))
+
+# Step 3: Merge completed data back with the original dataframe
+asn_layover_add_days_p <- rbind(not_needed_complete_data_p, completed_data_p)%>% 
+  filter(BID_TYPE == "R")
+
+
+```
+
+
+### Summarize by fleet and seat
+```{r}
+
+# Total number of available days
+# # total number of days assigned
+# 
+# rlv_Reamining
+# rlv_used
+# net rlv_availbe
+#
+# 4 day
+# 3 day
+# 2 day
+# 1 day 
+# net rlv_availbe
+
+
+fleat_seet_sum_p <- asn_layover_add_days_p %>% 
+  group_by(PAIRING_POSITION, trained_equipment, BID_PERIOD) %>% 
+  mutate(net_scr_available = length(unique(CREW_ID))) %>% 
+  ungroup() %>% 
+  group_by(PAIRING_POSITION, trained_equipment, TRANSACTION_CODE, BID_PERIOD) %>% 
+  mutate(scr_used = if_else(TRANSACTION_CODE == "ASN", length(unique(CREW_ID)), NA)) %>% 
+  ungroup() %>% 
+  mutate(net_scr_available = if_else(BID_PERIOD == "2024-03" & trained_equipment == "789", 
+                                        0, net_scr_available),
+         scr_used = if_else(BID_PERIOD == "2024-03" & trained_equipment == "789", 
+                                    0, scr_used)) %>% 
+  filter(!scr_used == 0) %>% 
+  select(PAIRING_POSITION, BID_PERIOD, BID_PERIOD, net_scr_available, scr_used, trained_equipment) %>% 
+  drop_na(scr_used) %>% 
+  group_by(PAIRING_POSITION, trained_equipment, BID_PERIOD) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  select(!temp_id) %>%
+  mutate(scr_remaining = net_scr_available - scr_used) %>% 
+  mutate(BID_PERIOD = as.Date(paste0(BID_PERIOD, "-01"), format = "%Y-%m-%d")) %>% 
+  filter(!trained_equipment == "33Y") %>% 
+  filter(!trained_equipment == "763")
+
+```
+
+
+### Visualize - FO
+```{r}
+
+## FO
+ 
+
+fleat_seet_sum_fo <- fleat_seet_sum_p %>% 
+  filter(PAIRING_POSITION == "FO")
+
+# Reshape data to long format
+long_data_fo <- fleat_seet_sum_p %>%
+  select(BID_PERIOD, PAIRING_POSITION, scr_used, scr_remaining) %>%
+  pivot_longer(cols = c(scr_used, scr_remaining), 
+               names_to = "scr_type", 
+               values_to = "Head_Count") %>% 
+  filter(PAIRING_POSITION == "FO")
+
+label_data_fo <- fleat_seet_sum_fo %>%
+  select(BID_PERIOD, net_scr_available)
+
+
+# Plot
+ggplot(fleat_seet_sum_fo) +
+  geom_bar(aes(x = BID_PERIOD, y = net_scr_available, fill = PAIRING_POSITION), 
+           stat = "identity", position = "dodge", alpha = 0.3) +
+  geom_bar(data = long_data_fo, 
+           aes(x = BID_PERIOD, y = Head_Count, fill = scr_type), 
+           stat = "identity", position = "stack") +
+  facet_wrap(~ trained_equipment, scales = "free_y") +
+  scale_x_date(date_labels = "%Y-%m", date_breaks = "2 month") +
+  scale_fill_manual(values = c( 
+                                "scr_remaining" = "#413691", 
+                                "scr_used" = "#D2058A")) +
+  labs(x = "Bid Period", y = "Primary SCR Head Count", fill = "RLV") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.text = element_text(size = 6),  # Adjust legend text size
+        legend.key.size = unit(0.25, "cm"),  # Adjust size of legend keys
+        legend.title = element_text(size = 5),  # Adjust legend title size
+        legend.box.spacing = unit(0.25, "cm"),# Adjust spacing around the legend box
+        plot.title = element_text(hjust = 0.5, size = 14
+        )) +
+  ggtitle("First Officer Utilization")  +
+  geom_text(data = label_data_fo,
+            aes(x = BID_PERIOD, y = net_scr_available, label = net_scr_available),
+            size = 2., vjust = -0.3, hjust = 0.5)
+
+
+
+
+
+
+```
+## Visualize - CA
+```{r}
+## CA
+
+fleat_seet_sum_ca <- fleat_seet_sum_p %>% 
+  filter(PAIRING_POSITION == "CA")
+
+# Reshape data to long format
+long_data_ca <- fleat_seet_sum_p %>%
+  select(BID_PERIOD, scr_used, scr_remaining) %>%
+  pivot_longer(cols = c(scr_used, scr_remaining), 
+               names_to = "scr_type", 
+               values_to = "Head_Count") %>% 
+  filter(PAIRING_POSITION == "CA")
+
+label_data_ca <- fleat_seet_sum_ca %>%
+  select(BID_PERIOD, net_scr_available)
+
+# Plot
+ggplot(fleat_seet_sum_ca) +
+  geom_bar(aes(x = BID_PERIOD, y = net_scr_available, fill = PAIRING_POSITION), 
+           stat = "identity", position = "dodge", alpha = 0.3) +
+  geom_bar(data = long_data_ca, 
+           aes(x = BID_PERIOD, y = Head_Count, fill = scr_type), 
+           stat = "identity", position = "stack") +
+  facet_wrap(~ trained_equipment, scales = "free_y") +
+  scale_x_date(date_labels = "%Y-%m", date_breaks = "2 month") +
+  scale_fill_manual(values = c( 
+                                "scr_remaining" = "#413691", 
+                                "scr_used" = "#D2058A")) +
+  labs(x = "Bid Period", y = "Primary SCR Head Count", fill = "SCR") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.text = element_text(size = 6),  # Adjust legend text size
+        legend.key.size = unit(0.25, "cm"),  # Adjust size of legend keys
+        legend.title = element_text(size = 5),  # Adjust legend title size
+        plot.title = element_text(hjust = 0.5, size = 14),
+        legend.box.spacing = unit(0.25, "cm")  # Adjust spacing around the legend box
+        ) +
+  geom_text(data = label_data_ca,
+            aes(x = BID_PERIOD, y = net_scr_available, label = net_scr_available),
+            size = 2., vjust = -0.3, hjust = 0.5) +
+  ggtitle("Captain Utilization")
+```

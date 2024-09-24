@@ -1,0 +1,535 @@
+---
+title: "reserve_utilization"
+format: html
+editor: source
+---
+
+### Packages
+```{r}
+
+if (!require(librarian)){
+  install.packages("librarian")
+  library(librarian)
+}
+
+# librarian downloads, if not already downloaded, and reads in needed packages
+librarian::shelf(tidyverse, here, DBI, odbc, scales, padr)
+
+```
+
+### Connect to `ENTERPRISE` Database
+```{r}
+
+tryCatch({
+    db_connection <- DBI::dbConnect(odbc::odbc(),
+                             Driver="SnowflakeDSIIDriver",
+                             Server="hawaiianair.west-us-2.azure.snowflakecomputing.com",
+                             WAREHOUSE="DATA_LAKE_READER",
+                             Database="ENTERPRISE",
+                             UID= Sys.getenv("UID"), # <- remove "Sys.getenv("UID")" and enter "your email"
+                             authenticator = "externalbrowser")
+    print("Database Connected!")
+    },
+    error=function(cond) {
+            print("Unable to connect to Database.")
+})
+
+
+
+
+# Set search_path
+dbExecute(db_connection, "USE SCHEMA CREW_ANALYTICS")
+
+```
+
+
+### `CT_MASTER_HISTORY`
+```{r}
+
+q_master_history <- "select * from CT_MASTER_HISTORY WHERE PAIRING_DATE BETWEEN '2019-01-01' AND '2024-08-01';"
+
+
+master_history_raw <- dbGetQuery(db_connection, q_master_history)
+
+
+
+pilot_trx_hist <- master_history_raw %>% 
+  filter(CREW_INDICATOR == "P") %>% 
+  mutate(update_dt = paste(UPDATE_DATE, UPDATE_TIME, sep = " ")) %>% 
+  group_by(CREW_ID, PAIRING_DATE, TRANSACTION_CODE) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  select(!temp_id) %>% 
+  ungroup() %>% 
+  group_by(CREW_ID, PAIRING_DATE) %>% 
+  mutate(keep = ifelse(any(TRANSACTION_CODE %in% c("SCR", "ASN", "RSV", "ARC", "RLV")), 1, 0)) %>% 
+  filter(keep == 1)
+
+  
+
+
+
+fa_trx_hist <- master_history_raw %>% 
+  filter(CREW_INDICATOR == "FA") %>% 
+  mutate(update_dt = paste(UPDATE_DATE, UPDATE_TIME, sep = " ")) %>% 
+  group_by(CREW_ID, PAIRING_DATE, TRANSACTION_CODE) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  select(!temp_id) %>% 
+  ungroup() %>% 
+  group_by(CREW_ID, PAIRING_DATE) %>% 
+  mutate(keep = ifelse(any(TRANSACTION_CODE %in% c("SCR", "ASN", "RSV", "ARC", "RLV")), 1, 0)) %>% 
+  filter(keep == 1)
+
+  
+
+```
+
+
+### Pilot UT
+```{r}
+
+pilot_ut <- master_history_raw %>% 
+  ungroup() %>% 
+  filter(CREW_INDICATOR == "P") %>% 
+  filter(TRANSACTION_CODE %in% c("ACR", "SCR", "ASN", "FLR")) %>% 
+  group_by(CREW_ID, PAIRING_DATE, TRANSACTION_CODE) %>%
+  mutate(update_dt = paste(UPDATE_DATE, UPDATE_TIME, sep = " ")) %>% 
+  filter(update_dt == max(update_dt)) %>% 
+  # mutate(temp_id = cur_group_id()) %>% 
+  # filter(!duplicated(temp_id)) %>% 
+  ungroup() %>% 
+  select(CREW_INDICATOR, CREW_ID, TRANSACTION_CODE, PAIRING_NO,
+         PAIRING_DATE, TO_DATE, PAIRING_POSITION, BID_PERIOD)
+
+
+```
+### FA UT
+```{r}
+
+fa_ut <- master_history_raw %>% 
+  ungroup() %>% 
+  filter(CREW_INDICATOR == "FA") %>% 
+  filter(TRANSACTION_CODE %in% c("ACR", "RSV", "RLV", "ASN")) %>% 
+  group_by(CREW_ID, PAIRING_DATE, TRANSACTION_CODE) %>%
+  mutate(update_dt = paste(UPDATE_DATE, UPDATE_TIME, sep = " ")) %>% 
+  filter(update_dt == max(update_dt)) %>% 
+  # mutate(temp_id = cur_group_id()) %>% 
+  # filter(!duplicated(temp_id)) %>% 
+  ungroup() %>% 
+  select(CREW_INDICATOR, CREW_ID, TRANSACTION_CODE, PAIRING_NO,
+         PAIRING_DATE, TO_DATE, PAIRING_POSITION, BID_PERIOD)
+
+```
+
+
+### `AA_FINAL_PAIRING`
+```{r}
+
+### Connect to `PLAYGROUND` Database
+tryCatch({
+    db_connection_pg <- DBI::dbConnect(odbc::odbc(),
+                             Driver="SnowflakeDSIIDriver",
+                             Server="hawaiianair.west-us-2.azure.snowflakecomputing.com",
+                             WAREHOUSE="DATA_LAKE_READER",
+                             Database="PLAYGROUND",
+                             UID= Sys.getenv("UID"), 
+                             authenticator = "externalbrowser")
+    print("Database Connected!")
+    },
+    error=function(cond) {
+            print("Unable to connect to Database.")
+})
+
+
+# Set search_path
+dbExecute(db_connection_pg, "USE SCHEMA CREW_ANALYTICS")
+
+q_final_pairing <- "select CREW_ID, PAIRING_NO, PAIRING_DATE, FLIGHT_DATE, EQUIPMENT, PAIRING_POSITION,
+                    DEPARTING_CITY, ARRIVAL_CITY, SCHED_DEPARTURE_TIME, SCHED_ARRIVAL_TIME
+                    from AA_FINAL_PAIRING WHERE PAIRING_DATE BETWEEN '2019-01-01' AND '2024-08-01';"
+
+final_pairing_raw <- dbGetQuery(db_connection_pg, q_final_pairing) 
+
+
+```
+
+
+### Pilot aircraft rating
+```{r}
+q_master_sched <- "select CREW_ID, EFFECTIVE_FROM_DATE, EFFECTIVE_TO_DATE, EQUIPMENT, PAIRING_POSITION, BID_DATE,
+                   UPDATE_DATE, UPDATE_TIME, BASE, BID_TYPE
+                   from CT_MASTER_SCHEDULE WHERE BID_DATE > '2018-12';"
+
+raw_ms <- dbGetQuery(db_connection, q_master_sched)
+
+clean_ms <- raw_ms %>% 
+  mutate(update_dt = paste(UPDATE_DATE, UPDATE_TIME, sep = " ")) %>% 
+  group_by(CREW_ID, EFFECTIVE_FROM_DATE, EFFECTIVE_TO_DATE, PAIRING_POSITION) %>% 
+  filter(update_dt == max(update_dt)) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  rename(BID_PERIOD = BID_DATE) %>% 
+  ungroup() %>% 
+  select(CREW_ID, BID_PERIOD, PAIRING_POSITION, EQUIPMENT, BASE, BID_TYPE) %>% 
+  rename(trained_equipment = EQUIPMENT)
+
+```
+
+
+### Fleet Pilot History 
+```{r}
+
+emp_hist_p <-  pilot_ut %>% 
+  left_join(final_pairing_raw, by = c("CREW_ID", "PAIRING_DATE", "PAIRING_NO", "PAIRING_POSITION")) %>% 
+  inner_join(clean_ms, by = c("CREW_ID", "BID_PERIOD", "PAIRING_POSITION")) %>% 
+  mutate(remove = if_else(TRANSACTION_CODE == "ASN" & is.na(FLIGHT_DATE),
+                               1, 0)) %>% 
+  filter(!remove == 1) %>% 
+  select(!remove) %>% 
+  filter(PAIRING_POSITION %in% c("CA", "FO")) %>% 
+  #select(!c(year, month)) %>% 
+  filter(BID_PERIOD > "2022-12",
+         BID_PERIOD < "2024-08") %>% 
+  mutate(year = year(PAIRING_DATE),
+         month = month(PAIRING_DATE),
+         year_month = paste(year, month, sep = "-")) %>% 
+  select(!c(year, month))
+
+
+```
+
+### Remove legs to get counts per day
+```{r}
+#20967
+
+emp_hist_no_legs_p <- emp_hist_p %>% 
+  group_by(CREW_ID, PAIRING_NO, FLIGHT_DATE, PAIRING_DATE) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  select(!c(temp_id, DEPARTING_CITY, ARRIVAL_CITY, SCHED_DEPARTURE_TIME, SCHED_ARRIVAL_TIME)) %>% 
+  ungroup()
+
+
+t_p <- emp_hist_no_legs_p %>% 
+  #filter(CREW_ID == "14473") %>% 
+  group_by(CREW_ID, TRANSACTION_CODE, PAIRING_NO, PAIRING_DATE)
+
+filtered_data_p <- t_p %>%
+  filter(!is.na(FLIGHT_DATE))
+
+# Step 2: Perform complete operations on the filtered data
+completed_data_p <- filtered_data_p %>%
+  group_by(CREW_ID, TRANSACTION_CODE, PAIRING_NO, PAIRING_DATE) %>%
+  complete(FLIGHT_DATE = seq(min(FLIGHT_DATE, na.rm = TRUE), 
+                             max(FLIGHT_DATE, na.rm = TRUE), 
+                             by = "day")) %>%
+  fill(everything(), .direction = "down") %>%
+  ungroup()
+
+not_needed_complete_data_p <- t_p %>% 
+  filter(is.na(FLIGHT_DATE))
+
+# Step 3: Merge completed data back with the original dataframe
+asn_layover_add_days_p <- rbind(not_needed_complete_data_p, completed_data_p)
+
+
+```
+
+
+### Summarize by fleet and seat
+```{r}
+
+# Total number of available days
+# # total number of days assigned
+# 
+# rlv_Reamining
+# rlv_used
+# net rlv_availbe
+#
+# 4 day
+# 3 day
+# 2 day
+# 1 day 
+# net rlv_availbe
+
+# fleat_seet_sum <- emp_hist_no_legs %>% 
+#   # group_by(PAIRING_POSITION, CREW_ID, PAIRING_DATE, PAIRING_NO) %>%
+#   # mutate(temp_id = cur_group_id()) %>%
+#   # filter(!duplicated(temp_id)) %>%
+#   # select(!temp_id) %>%
+#   # ungroup() %>%
+#   group_by(PAIRING_POSITION, trained_equipment, year_month) %>% 
+#   mutate(seat_equip_count = n()) %>% 
+#   ungroup() %>% 
+#   group_by(PAIRING_POSITION, trained_equipment, TRANSACTION_CODE, year_month) %>% 
+#   mutate(asn_count_seat_equip = if_else(TRANSACTION_CODE == "ASN", n(), NA)) %>% 
+#   ungroup() %>% 
+#   select(PAIRING_POSITION, trained_equipment, asn_count_seat_equip, seat_equip_count, year_month) %>% 
+#   drop_na(asn_count_seat_equip) %>% 
+#   group_by(PAIRING_POSITION, trained_equipment, year_month) %>% 
+#   mutate(temp_id = cur_group_id()) %>% 
+#   filter(!duplicated(temp_id)) %>% 
+#   select(!temp_id) %>%
+#   ungroup() %>% 
+#   mutate(asn_count_seat_equip = if_else(year_month == "2024-3" & trained_equipment == "789", 
+#                                         0, asn_count_seat_equip),
+#          seat_equip_count = if_else(year_month == "2024-3" & trained_equipment == "789", 
+#                                     0, seat_equip_count)) %>% 
+#   filter(!asn_count_seat_equip == 0) %>% 
+#   mutate(utl = asn_count_seat_equip/seat_equip_count*100) %>% 
+#   ungroup() %>% 
+#   filter(!trained_equipment == "33Y") %>% 
+#   filter(!trained_equipment == "763") %>% 
+#   group_by(PAIRING_POSITION, trained_equipment) %>% 
+#   mutate(utl_avg = mean(utl)) %>% 
+#   ungroup()%>%
+#   mutate(year_month = as.Date(paste0(year_month, "-01"), format = "%Y-%m-%d"))
+
+
+fleat_seet_sum_p <- asn_layover_add_days_p %>% 
+  group_by(PAIRING_POSITION, trained_equipment, BID_PERIOD) %>% 
+  mutate(net_rlv_available = length(unique(CREW_ID))) %>% 
+  ungroup() %>% 
+  group_by(PAIRING_POSITION, trained_equipment, TRANSACTION_CODE, BID_PERIOD) %>% 
+  mutate(rlv_used = if_else(TRANSACTION_CODE == "ASN", length(unique(CREW_ID)), NA)) %>% 
+  ungroup() %>% 
+  mutate(net_rlv_available = if_else(BID_PERIOD == "2024-03" & trained_equipment == "789", 
+                                        0, net_rlv_available),
+         rlv_used = if_else(BID_PERIOD == "2024-03" & trained_equipment == "789", 
+                                    0, rlv_used)) %>% 
+  filter(!rlv_used == 0) %>% 
+  select(PAIRING_POSITION, BID_PERIOD, BID_PERIOD, net_rlv_available, rlv_used, trained_equipment) %>% 
+  drop_na(rlv_used) %>% 
+  group_by(PAIRING_POSITION, trained_equipment, BID_PERIOD) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  select(!temp_id) %>%
+  mutate(rlv_remaining = net_rlv_available - rlv_used) %>% 
+  mutate(BID_PERIOD = as.Date(paste0(BID_PERIOD, "-01"), format = "%Y-%m-%d")) %>% 
+  filter(!trained_equipment == "33Y") %>% 
+  filter(!trained_equipment == "763")
+
+```
+
+
+### Visualize - FO
+```{r}
+
+## FO
+ 
+
+fleat_seet_sum_fo <- fleat_seet_sum_p %>% 
+  filter(PAIRING_POSITION == "FO")
+
+# Reshape data to long format
+long_data_fo <- fleat_seet_sum_p %>%
+  select(BID_PERIOD, PAIRING_POSITION, rlv_used, rlv_remaining) %>%
+  pivot_longer(cols = c(rlv_used, rlv_remaining), 
+               names_to = "rlv_type", 
+               values_to = "Head_Count") %>% 
+  filter(PAIRING_POSITION == "FO")
+
+label_data_fo <- fleat_seet_sum_fo %>%
+  select(BID_PERIOD, net_rlv_available)
+
+
+# Plot
+ggplot(fleat_seet_sum_fo) +
+  geom_bar(aes(x = BID_PERIOD, y = net_rlv_available, fill = PAIRING_POSITION), 
+           stat = "identity", position = "dodge", alpha = 0.3) +
+  geom_bar(data = long_data_fo, 
+           aes(x = BID_PERIOD, y = Head_Count, fill = rlv_type), 
+           stat = "identity", position = "stack") +
+  facet_wrap(~ trained_equipment, scales = "free_y") +
+  scale_x_date(date_labels = "%Y-%m", date_breaks = "2 month") +
+  scale_fill_manual(values = c( 
+                                "rlv_remaining" = "#413691", 
+                                "rlv_used" = "#D2058A")) +
+  labs(x = "Bid Period", y = "Head Count", fill = "RLV") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+         plot.title = element_text(hjust = 0.5)) +
+  ggtitle("First Officer Utilization")  +
+  geom_text(data = label_data_fo,
+            aes(x = BID_PERIOD, y = net_rlv_available, label = net_rlv_available),
+            size = 2., vjust = -0.3, hjust = 0.5)
+
+
+
+
+
+
+```
+## Visualize - CA
+```{r}
+## CA
+
+fleat_seet_sum_ca <- fleat_seet_sum_p %>% 
+  filter(PAIRING_POSITION == "CA")
+
+# Reshape data to long format
+long_data_ca <- fleat_seet_sum_p %>%
+  select(BID_PERIOD, rlv_used, rlv_remaining) %>%
+  pivot_longer(cols = c(rlv_used, rlv_remaining), 
+               names_to = "rlv_type", 
+               values_to = "Head_Count") %>% 
+  filter(PAIRING_POSITION == "CA")
+
+label_data_ca <- fleat_seet_sum_ca %>%
+  select(BID_PERIOD, net_rlv_available)
+
+# Plot
+ggplot(fleat_seet_sum_ca) +
+  geom_bar(aes(x = BID_PERIOD, y = net_rlv_available, fill = PAIRING_POSITION), 
+           stat = "identity", position = "dodge", alpha = 0.3) +
+  geom_bar(data = long_data_ca, 
+           aes(x = BID_PERIOD, y = Head_Count, fill = rlv_type), 
+           stat = "identity", position = "stack") +
+  facet_wrap(~ trained_equipment, scales = "free_y") +
+  scale_x_date(date_labels = "%Y-%m", date_breaks = "2 month") +
+  scale_fill_manual(values = c( 
+                                "rlv_remaining" = "#413691", 
+                                "rlv_used" = "#D2058A")) +
+  labs(x = "Year-Month", y = "Head Count", fill = "RLV") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+         plot.title = element_text(hjust = 0.5)) +
+  ggtitle("Captain Utilization")  +
+  geom_text(data = label_data_ca,
+            aes(x = BID_PERIOD, y = net_rlv_available, label = net_rlv_available),
+            size = 2., vjust = -0.3, hjust = 0.5)
+```
+
+
+## FA Utilization with legs
+```{r}
+
+emp_hist_fa <-  fa_ut %>% 
+  left_join(final_pairing_raw, by = c("CREW_ID", "PAIRING_DATE", "PAIRING_NO", "PAIRING_POSITION")) %>% 
+  #select(!asn) %>% 
+  inner_join(clean_ms, by = c("CREW_ID", "BID_PERIOD", "PAIRING_POSITION")) %>% 
+  mutate(remove = if_else(TRANSACTION_CODE == "ASN" & is.na(FLIGHT_DATE),
+                               1, 0)) %>%
+  filter(!remove == 1) %>%
+  select(!c(remove, trained_equipment)) %>%
+  filter(BID_PERIOD > "2022-12",
+         BID_PERIOD < "2024-08") %>% 
+  mutate(year = year(PAIRING_DATE),
+         month = month(PAIRING_DATE),
+         year_month = paste(year, month, sep = "-")) %>% 
+  select(!c(year, month))
+
+
+a <- clean_ms %>% 
+  filter(PAIRING_POSITION == "FA",
+         BID_PERIOD == "2023-01")
+
+b <- asn_layover_add_days_fa %>% 
+  filter(PAIRING_POSITION == "FA",
+         BASE == "HNL",
+         BID_PERIOD == "2023-01")
+```
+
+## FA UTl with out legs - and add lay over days as ASN
+```{r}
+
+emp_hist_fa_no_legs <- emp_hist_fa %>% 
+  group_by(CREW_ID, PAIRING_NO, FLIGHT_DATE, PAIRING_DATE) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  select(!c(temp_id, DEPARTING_CITY, ARRIVAL_CITY, SCHED_DEPARTURE_TIME, SCHED_ARRIVAL_TIME)) %>% 
+  ungroup()
+  
+t_fa <- emp_hist_fa_no_legs %>% 
+  #filter(CREW_ID == "14473") %>% 
+  group_by(CREW_ID, TRANSACTION_CODE, PAIRING_NO, PAIRING_DATE)
+
+filtered_data_fa <- t_fa %>%
+  filter(!is.na(FLIGHT_DATE))
+
+# Step 2: Perform complete operations on the filtered data
+completed_data_fa <- filtered_data_fa %>%
+  group_by(CREW_ID, TRANSACTION_CODE, PAIRING_NO, PAIRING_DATE) %>%
+  complete(FLIGHT_DATE = seq(min(FLIGHT_DATE, na.rm = TRUE), 
+                             max(FLIGHT_DATE, na.rm = TRUE), 
+                             by = "day")) %>%
+  fill(everything(), .direction = "down") %>%
+  ungroup()
+
+not_needed_complete_data_fa <- t_fa %>% 
+  filter(is.na(FLIGHT_DATE))
+
+# Step 3: Merge completed data back with the original dataframe
+asn_layover_add_days_fa <- rbind(not_needed_complete_data_fa, completed_data_fa)
+```
+
+## Summarize by Base
+```{r}
+# Total number of available days
+# # total number of days assigned
+# 
+# rlv_Reamining
+# rlv_used
+# net rlv_availbe
+#
+# 4 day
+# 3 day
+# 2 day
+# 1 day 
+# net rlv_availbe
+
+fleat_seet_sum_fa <- asn_layover_add_days_fa %>% 
+  group_by(PAIRING_POSITION, BASE, BID_PERIOD) %>% 
+  mutate(net_rlv_available =length(unique(CREW_ID))) %>% 
+  ungroup() %>% 
+  group_by(PAIRING_POSITION, BASE, TRANSACTION_CODE, BID_PERIOD) %>% 
+  mutate(rlv_used = if_else(TRANSACTION_CODE == "ASN", length(unique(CREW_ID)), NA)) %>% 
+  ungroup() %>% 
+  select(PAIRING_POSITION, BASE, rlv_used, net_rlv_available, year_month, BID_PERIOD) %>% 
+  drop_na(rlv_used) %>% 
+  group_by(PAIRING_POSITION, BASE, BID_PERIOD) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  select(!temp_id) %>%
+  mutate(rlv_remaining = net_rlv_available - rlv_used) %>% 
+  mutate(BID_PERIOD = as.Date(paste0(BID_PERIOD, "-01"), format = "%Y-%m-%d"))
+
+```
+
+## Vsualize
+```{r}
+
+# Reshape data to long format
+long_data <- fleat_seet_sum_fa %>%
+  select(BID_PERIOD, BASE, rlv_used, rlv_remaining) %>%
+  pivot_longer(cols = c(rlv_used, rlv_remaining), 
+               names_to = "rlv_type", 
+               values_to = "Head_Count")
+
+label_data <- fleat_seet_sum_fa %>%
+  select(BID_PERIOD, BASE, net_rlv_available)
+
+# Plot
+ggplot(fleat_seet_sum_fa) +
+  geom_bar(aes(x = BID_PERIOD, y = net_rlv_available, fill = "net_rlv_available"), 
+           stat = "identity", alpha = 0.3) +
+  geom_bar(data = long_data, 
+           aes(x = BID_PERIOD, y = Head_Count, fill = rlv_type), 
+           stat = "identity", position = "stack") +
+  facet_wrap(~ BASE, scales = "free_y") +
+  scale_x_date(date_labels = "%Y-%m", date_breaks = "2 month") +
+  scale_fill_manual(values = c( 
+                                "rlv_remaining" = "#413691", 
+                                "rlv_used" = "#D2058A")) +
+  labs(x = "Bid Period", y = "Head Count", fill = "RLV Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  geom_text(data = label_data,
+            aes(x = BID_PERIOD, y = net_rlv_available, label = net_rlv_available),
+            size = 1.9, vjust = -0.75, hjust = 0.5,
+            position = position_jitter(width = 0.2, height = .25))
+
+
+```
+

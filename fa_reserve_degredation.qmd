@@ -1,0 +1,275 @@
+---
+title: "fa_reserve_degredation"
+format: html
+editor: source
+---
+
+### Packages
+```{r}
+
+if (!require(librarian)){
+  install.packages("librarian")
+  library(librarian)
+}
+
+# librarian downloads, if not already downloaded, and reads in needed packages
+librarian::shelf(tidyverse, here, DBI, odbc, scales, padr)
+
+```
+
+
+### Connect to `ENTERPRISE` Database
+```{r}
+
+tryCatch({
+    db_connection <- DBI::dbConnect(odbc::odbc(),
+                             Driver="SnowflakeDSIIDriver",
+                             Server="hawaiianair.west-us-2.azure.snowflakecomputing.com",
+                             WAREHOUSE="DATA_LAKE_READER",
+                             Database="ENTERPRISE",
+                             UID= Sys.getenv("UID"), # <- remove "Sys.getenv("UID")" and enter "your email"
+                             authenticator = "externalbrowser")
+    print("Database Connected!")
+    },
+    error=function(cond) {
+            print("Unable to connect to Database.")
+})
+
+
+
+
+# Set search_path
+dbExecute(db_connection, "USE SCHEMA CREW_ANALYTICS")
+
+```
+
+### `AA_FINAL_PAIRING`
+```{r}
+
+### Connect to `PLAYGROUND` Database
+tryCatch({
+    db_connection_pg <- DBI::dbConnect(odbc::odbc(),
+                             Driver="SnowflakeDSIIDriver",
+                             Server="hawaiianair.west-us-2.azure.snowflakecomputing.com",
+                             WAREHOUSE="DATA_LAKE_READER",
+                             Database="PLAYGROUND",
+                             UID= Sys.getenv("UID"), 
+                             authenticator = "externalbrowser")
+    print("Database Connected!")
+    },
+    error=function(cond) {
+            print("Unable to connect to Database.")
+})
+
+
+# Set search_path
+dbExecute(db_connection_pg, "USE SCHEMA CREW_ANALYTICS")
+
+q_final_pairing <- "select CREW_ID, PAIRING_NO, PAIRING_DATE, FLIGHT_DATE, EQUIPMENT, PAIRING_POSITION,
+                    DEPARTING_CITY, ARRIVAL_CITY, SCHED_DEPARTURE_TIME, SCHED_ARRIVAL_TIME, BID_PERIOD
+                    from AA_FINAL_PAIRING WHERE PAIRING_DATE BETWEEN '2019-01-01' AND '2024-08-01';"
+
+final_pairing_raw <- dbGetQuery(db_connection_pg, q_final_pairing) 
+
+
+```
+
+### `CT_MASTER_HISTORY`
+```{r}
+
+q_master_history <- "select * from CT_MASTER_HISTORY WHERE PAIRING_DATE BETWEEN '2019-01-01' AND '2024-08-01';"
+
+
+master_history_raw <- dbGetQuery(db_connection, q_master_history)
+
+
+
+fa_trx_hist <- master_history_raw %>% 
+  filter(CREW_INDICATOR == "FA") %>% 
+  mutate(update_dt = paste(UPDATE_DATE, UPDATE_TIME, sep = " ")) %>% 
+  group_by(CREW_ID, PAIRING_DATE, TRANSACTION_CODE) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  select(!temp_id) %>% 
+  ungroup() %>% 
+  group_by(CREW_ID, PAIRING_DATE) %>% 
+  mutate(keep = ifelse(any(TRANSACTION_CODE %in% c("SCR", "ASN", "RSV", "ARC", "RLV")), 1, 0)) %>% 
+  filter(keep == 1)
+
+
+#2SK
+#SOP
+
+```
+
+
+### FA with Sick code following ASN
+```{r}
+
+sick_follow_asn <- fa_trx_hist %>% 
+  group_by(CREW_ID, PAIRING_DATE) %>% 
+  mutate(keep = if_else(any(TRANSACTION_CODE %in% c("SOP", "2SK")), 1, 0)) %>% 
+  filter(keep == 1)
+
+```
+
+
+### Base 
+```{r}
+# q_master_sched <- "select CREW_ID, EFFECTIVE_FROM_DATE, EFFECTIVE_TO_DATE, EQUIPMENT, PAIRING_POSITION, BID_DATE,
+#                    UPDATE_DATE, UPDATE_TIME, BASE, BID_TYPE
+#                    from CT_MASTER_SCHEDULE WHERE BID_DATE > '2018-12';"
+# 
+# raw_ms <- dbGetQuery(db_connection, q_master_sched)
+# 
+# clean_ms <- raw_ms %>% 
+#   mutate(update_dt = paste(UPDATE_DATE, UPDATE_TIME, sep = " ")) %>% 
+#   group_by(CREW_ID, EFFECTIVE_FROM_DATE, EFFECTIVE_TO_DATE, PAIRING_POSITION) %>% 
+#   filter(update_dt == max(update_dt)) %>% 
+#   mutate(temp_id = cur_group_id()) %>% 
+#   filter(!duplicated(temp_id)) %>% 
+#   rename(BID_PERIOD = BID_DATE) %>% 
+#   ungroup() %>% 
+#   select(CREW_ID, BID_PERIOD, PAIRING_POSITION, EQUIPMENT, BASE, BID_TYPE) %>% 
+#   rename(trained_equipment = EQUIPMENT)
+
+```
+
+## Sick Base
+```{r}
+
+emp_sick_hist_fa <-  sick_follow_asn %>% 
+  anti_join(final_pairing_raw, by = c("CREW_ID", "PAIRING_DATE", "PAIRING_NO", "PAIRING_POSITION")) %>% 
+  #inner_join(clean_ms, by = c("CREW_ID", "BID_PERIOD", "PAIRING_POSITION", "BASE")) %>% 
+  select(!keep) %>% 
+  group_by(CREW_ID, PAIRING_DATE) %>% 
+  mutate(keep = if_else(any(TRANSACTION_CODE %in% c("ASN")), 1, 0)) %>%
+  filter(keep == 1) %>%
+  filter(BID_PERIOD == "2024-07")
+
+```
+
+```{r}
+
+sum_fa_rsk_sop <- sick_follow_asn %>% 
+  filter(BID_PERIOD == "2024-07") %>% 
+  group_by(CREW_ID, PAIRING_DATE) %>% 
+  mutate(keep = if_else(any(TRANSACTION_CODE %in% c("ASN")), 1, 0)) %>%
+  filter(keep == 1) %>%
+  group_by(PAIRING_POSITION, BASE, PAIRING_DATE, TRANSACTION_CODE) %>% 
+  summarise(rlv_asn_2sk = if_else(TRANSACTION_CODE == "2SK", length(unique(CREW_ID)), NA),
+         rlv_asn_sop = if_else(TRANSACTION_CODE == "SOP", length(unique(CREW_ID)), NA)) %>% 
+  ungroup() %>% 
+  select(PAIRING_POSITION, BASE, rlv_asn_2sk, rlv_asn_sop, PAIRING_DATE)  %>% 
+  group_by(PAIRING_POSITION, BASE, rlv_asn_2sk, rlv_asn_sop, PAIRING_DATE) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  select(!temp_id)
+
+```
+### HNL
+```{r}
+
+sum_fa_rsk_sop_hnl <- sum_fa_rsk_sop %>% 
+  filter(BASE == "HNL")
+
+# Reshape data to long format
+long_data_deg_fa_hnl <- sum_fa_rsk_sop_hnl %>%
+  select(PAIRING_DATE, BASE, rlv_asn_2sk, rlv_asn_sop) %>%
+  pivot_longer(cols = c(rlv_asn_sop, rlv_asn_2sk), 
+               names_to = "sick_type", 
+               values_to = "Head_Count") %>% 
+  drop_na(Head_Count) %>% 
+  mutate(sick_type=if_else(sick_type == "rlv_asn_2sk", "2SK", "SOP"))
+
+
+label_data_fa_rsk_hnl <- sum_fa_rsk_sop_hnl %>%
+  ungroup() %>% 
+  select(PAIRING_DATE, BASE, rlv_asn_2sk) %>% 
+  drop_na(rlv_asn_2sk) 
+
+label_data_fa_sop_hnl <- sum_fa_rsk_sop_hnl %>%
+  ungroup() %>% 
+  select(PAIRING_DATE, BASE, rlv_asn_sop) %>% 
+  drop_na(rlv_asn_sop) 
+
+
+ggplot(sum_fa_rsk_sop_hnl) +
+  geom_bar(data = long_data_deg_fa_hnl, 
+           aes(x = PAIRING_DATE, y = Head_Count, fill = sick_type), 
+           stat = "identity", position = "stack") +
+  scale_x_date(date_labels = "%Y-%m-%d", date_breaks = "3 days") +
+  scale_fill_manual(values = c( 
+                                "SOP" = "#413691", 
+                                "2SK" = "#D2058A")) +
+  labs(x = "Date", y = "Primary Head Count", fill = "RLV Sick Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.text = element_text(size = 6),  # Adjust legend text size
+        legend.key.size = unit(0.25, "cm"),  # Adjust size of legend keys
+        legend.title = element_text(size = 5),  # Adjust legend title size
+        legend.box.spacing = unit(0.25, "cm")  # Adjust spacing around the legend box
+        ) +
+  ggtitle("HNL") +
+  geom_text(data = label_data_fa_rsk_hnl,
+            aes(x = PAIRING_DATE, y = rlv_asn_2sk, label = rlv_asn_2sk),
+            size = 1.9, vjust = -0.75, hjust = 0.5) +
+  geom_text(data = label_data_fa_sop_hnl,
+            aes(x = PAIRING_DATE, y = rlv_asn_sop, label = rlv_asn_sop),
+            size = 1.9, vjust = -0.75, hjust = 0.5)
+
+
+
+```
+### LAX
+```{r}
+
+sum_fa_rsk_sop_lax <- sum_fa_rsk_sop %>% 
+  filter(BASE == "LAX")
+
+# Reshape data to long format
+long_data_deg_fa_lax <- sum_fa_rsk_sop_lax %>%
+  select(PAIRING_DATE, BASE, rlv_asn_2sk, rlv_asn_sop) %>%
+  pivot_longer(cols = c(rlv_asn_sop, rlv_asn_2sk), 
+               names_to = "sick_type", 
+               values_to = "Head_Count") %>% 
+  drop_na(Head_Count)
+
+label_data_fa_rsk_lax <- sum_fa_rsk_sop_lax %>%
+  ungroup() %>% 
+  select(PAIRING_DATE, BASE, rlv_asn_2sk) %>% 
+  drop_na(rlv_asn_2sk) 
+
+label_data_fa_sop_lax <- sum_fa_rsk_sop_lax %>%
+  ungroup() %>% 
+  select(PAIRING_DATE, BASE, rlv_asn_sop) %>% 
+  drop_na(rlv_asn_sop) 
+
+
+ggplot(sum_fa_rsk_sop_lax) +
+  geom_bar(data = long_data_deg_fa_lax, 
+           aes(x = PAIRING_DATE, y = Head_Count, fill = sick_type), 
+           stat = "identity", position = "stack") +
+  scale_x_date(date_labels = "%Y-%m-%d", date_breaks = "3 days") +
+  scale_fill_manual(values = c( 
+                                "rlv_asn_sop" = "#413691", 
+                                "rlv_asn_2sk" = "#D2058A")) +
+  labs(x = "Date", y = "Primary Head Count", fill = "RLV Sick Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.text = element_text(size = 6),  # Adjust legend text size
+        legend.key.size = unit(0.25, "cm"),  # Adjust size of legend keys
+        legend.title = element_text(size = 5),  # Adjust legend title size
+        legend.box.spacing = unit(0.25, "cm")  # Adjust spacing around the legend box
+        ) +
+  ggtitle("LAX RLV FA Head Count with ASN Code Proceeded by SOP/2SK Code") +
+  geom_text(data = label_data_fa_rsk_lax,
+            aes(x = PAIRING_DATE, y = rlv_asn_2sk, label = rlv_asn_2sk),
+            size = 1.9, vjust = -0.75, hjust = 0.5) +
+  geom_text(data = label_data_fa_sop_lax,
+            aes(x = PAIRING_DATE, y = rlv_asn_sop, label = rlv_asn_sop),
+            size = 1.9, vjust = -0.75, hjust = 0.5)
+
+
+
+```

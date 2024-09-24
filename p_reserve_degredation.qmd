@@ -1,0 +1,266 @@
+---
+title: "p_reserve_degredation"
+format: html
+editor: source
+---
+
+### Packages
+```{r}
+
+if (!require(librarian)){
+  install.packages("librarian")
+  library(librarian)
+}
+
+# librarian downloads, if not already downloaded, and reads in needed packages
+librarian::shelf(tidyverse, here, DBI, odbc, scales, padr)
+
+```
+
+
+### Connect to `ENTERPRISE` Database
+```{r}
+
+tryCatch({
+    db_connection <- DBI::dbConnect(odbc::odbc(),
+                             Driver="SnowflakeDSIIDriver",
+                             Server="hawaiianair.west-us-2.azure.snowflakecomputing.com",
+                             WAREHOUSE="DATA_LAKE_READER",
+                             Database="ENTERPRISE",
+                             UID= Sys.getenv("UID"), # <- remove "Sys.getenv("UID")" and enter "your email"
+                             authenticator = "externalbrowser")
+    print("Database Connected!")
+    },
+    error=function(cond) {
+            print("Unable to connect to Database.")
+})
+
+
+
+
+# Set search_path
+dbExecute(db_connection, "USE SCHEMA CREW_ANALYTICS")
+
+```
+
+### `AA_FINAL_PAIRING`
+```{r}
+
+### Connect to `PLAYGROUND` Database
+tryCatch({
+    db_connection_pg <- DBI::dbConnect(odbc::odbc(),
+                             Driver="SnowflakeDSIIDriver",
+                             Server="hawaiianair.west-us-2.azure.snowflakecomputing.com",
+                             WAREHOUSE="DATA_LAKE_READER",
+                             Database="PLAYGROUND",
+                             UID= Sys.getenv("UID"), 
+                             authenticator = "externalbrowser")
+    print("Database Connected!")
+    },
+    error=function(cond) {
+            print("Unable to connect to Database.")
+})
+
+
+# Set search_path
+dbExecute(db_connection_pg, "USE SCHEMA CREW_ANALYTICS")
+
+q_final_pairing <- "select CREW_ID, PAIRING_NO, PAIRING_DATE, FLIGHT_DATE, EQUIPMENT, PAIRING_POSITION,
+                    DEPARTING_CITY, ARRIVAL_CITY, SCHED_DEPARTURE_TIME, SCHED_ARRIVAL_TIME
+                    from AA_FINAL_PAIRING WHERE PAIRING_DATE BETWEEN '2019-01-01' AND '2024-08-01';"
+
+final_pairing_raw <- dbGetQuery(db_connection_pg, q_final_pairing) 
+
+
+```
+
+### `CT_MASTER_HISTORY`
+```{r}
+
+q_master_history <- "select * from CT_MASTER_HISTORY WHERE PAIRING_DATE BETWEEN '2019-01-01' AND '2024-08-01';"
+
+
+master_history_raw <- dbGetQuery(db_connection, q_master_history)
+
+
+pilot_trx_hist <- master_history_raw %>% 
+  filter(CREW_INDICATOR == "P") %>% 
+  mutate(update_dt = paste(UPDATE_DATE, UPDATE_TIME, sep = " ")) %>% 
+  group_by(CREW_ID, PAIRING_DATE, TRANSACTION_CODE) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  select(!temp_id) %>% 
+  ungroup() %>% 
+  group_by(CREW_ID, PAIRING_DATE) %>% 
+  mutate(keep = ifelse(any(TRANSACTION_CODE %in% c("SCR", "ASN", "RSV", "ARC", "RLV")), 1, 0)) %>% 
+  filter(keep == 1)
+
+#1sk
+#sop
+```
+
+
+### P with Sick code following ASN
+```{r}
+
+sick_follow_asn_p <- pilot_trx_hist %>% 
+  group_by(CREW_ID, PAIRING_DATE) %>% 
+  mutate(keep = if_else(any(TRANSACTION_CODE %in% c("SOP", "1SK")), 1, 0)) %>% 
+  filter(keep == 1)
+
+```
+
+### Training Equipment 
+```{r}
+q_master_sched <- "select CREW_ID, EFFECTIVE_FROM_DATE, EFFECTIVE_TO_DATE, EQUIPMENT, PAIRING_POSITION, BID_DATE,
+                   UPDATE_DATE, UPDATE_TIME, BASE, BID_TYPE
+                   from CT_MASTER_SCHEDULE WHERE BID_DATE > '2018-12';"
+
+raw_ms <- dbGetQuery(db_connection, q_master_sched)
+
+clean_ms <- raw_ms %>% 
+  mutate(update_dt = paste(UPDATE_DATE, UPDATE_TIME, sep = " ")) %>% 
+  group_by(CREW_ID, EFFECTIVE_FROM_DATE, EFFECTIVE_TO_DATE, PAIRING_POSITION) %>% 
+  filter(update_dt == max(update_dt)) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  rename(BID_PERIOD = BID_DATE) %>% 
+  ungroup() %>% 
+  select(CREW_ID, BID_PERIOD, PAIRING_POSITION, EQUIPMENT, BASE, BID_TYPE) %>% 
+  rename(trained_equipment = EQUIPMENT)
+
+```
+
+## Sick Base
+```{r}
+
+emp_sick_hist_p <-  sick_follow_asn_p %>% 
+  anti_join(final_pairing_raw, by = c("CREW_ID", "PAIRING_DATE", "PAIRING_NO", "PAIRING_POSITION")) %>% 
+  inner_join(clean_ms, by = c("CREW_ID", "BID_PERIOD", "PAIRING_POSITION", "BASE")) %>% 
+  select(!keep) %>% 
+  group_by(CREW_ID, PAIRING_DATE) %>% 
+  mutate(keep = if_else(any(TRANSACTION_CODE %in% c("ASN")), 1, 0)) %>%
+  filter(keep == 1) %>%
+  filter(BID_PERIOD > "2022-12",
+         BID_PERIOD < "2024-08")
+
+```
+
+```{r}
+sum_p_rsk_sop <- emp_sick_hist_p %>% 
+  group_by(PAIRING_POSITION, trained_equipment, BID_PERIOD, TRANSACTION_CODE) %>% 
+  summarise(scr_asn_1sk = if_else(TRANSACTION_CODE == "1SK", length(unique(CREW_ID)), NA),
+         scr_asn_sop = if_else(TRANSACTION_CODE == "SOP", length(unique(CREW_ID)), NA)) %>% 
+  ungroup() %>% 
+  select(PAIRING_POSITION, trained_equipment, scr_asn_1sk, scr_asn_sop, BID_PERIOD)  %>% 
+  group_by(PAIRING_POSITION, trained_equipment, scr_asn_1sk, scr_asn_sop, BID_PERIOD) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id)) %>% 
+  select(!temp_id) %>%
+  mutate(BID_PERIOD = as.Date(paste0(BID_PERIOD, "-01"), format = "%Y-%m-%d"))%>% 
+  filter(!trained_equipment == "33Y")
+```
+# FO
+```{r}
+
+sum_p_rsk_sop_fo <- sum_p_rsk_sop %>% 
+  filter(PAIRING_POSITION == "FO")
+
+ #Reshape data to long format
+long_data_deg_fo <- sum_p_rsk_sop_fo %>%
+  select(BID_PERIOD, trained_equipment, scr_asn_1sk, scr_asn_sop) %>%
+  pivot_longer(cols = c(scr_asn_sop, scr_asn_1sk), 
+               names_to = "sick_type", 
+               values_to = "Head_Count") %>% 
+  drop_na(Head_Count) 
+
+label_data_fo_rsk <- sum_p_rsk_sop_fo %>%
+  ungroup() %>% 
+  select(BID_PERIOD, trained_equipment, scr_asn_1sk) %>% 
+  drop_na(scr_asn_1sk) 
+
+label_data_fo_sop <- sum_p_rsk_sop_fo %>%
+  ungroup() %>% 
+  select(BID_PERIOD, trained_equipment, scr_asn_sop) %>% 
+  drop_na(scr_asn_sop) 
+
+
+ggplot() +
+  geom_bar(data = long_data_deg_fo, 
+           aes(x = BID_PERIOD, y = Head_Count, fill = sick_type), 
+           stat = "identity", position = "stack") +
+  facet_wrap(~ trained_equipment, scales = "free_y") +
+  scale_x_date(date_labels = "%Y-%m", date_breaks = "2 month") +
+  scale_fill_manual(values = c( 
+                                "scr_asn_sop" = "#413691", 
+                                "scr_asn_1sk" = "#D2058A")) +
+  labs(x = "Bid Period", y = "Primary Head Count", fill = "RLV Sick Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.text = element_text(size = 6),  # Adjust legend text size
+        legend.key.size = unit(0.25, "cm"),  # Adjust size of legend keys
+        legend.title = element_text(size = 5),  # Adjust legend title size
+        legend.box.spacing = unit(0.25, "cm")  # Adjust spacing around the legend box
+        ) +
+  ggtitle("SCR FO Head Count with ASN Code Proceeded by SOP/2SK Code") +
+  geom_text(data = label_data_fo_rsk,
+            aes(x = BID_PERIOD, y = scr_asn_1sk, label = scr_asn_1sk),
+            size = 1.9, vjust = -0.75, hjust = 0.5) +
+  geom_text(data = label_data_fo_sop,
+            aes(x = BID_PERIOD, y = scr_asn_sop, label = scr_asn_sop),
+            size = 1.9, vjust = -0.75, hjust = 0.5) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 5))
+```
+
+# CA
+```{r}
+
+sum_p_rsk_sop_ca <- sum_p_rsk_sop %>% 
+  filter(PAIRING_POSITION == "CA")
+
+ #Reshape data to long format
+long_data_deg_ca <- sum_p_rsk_sop_ca %>%
+  select(BID_PERIOD, trained_equipment, scr_asn_1sk, scr_asn_sop) %>%
+  pivot_longer(cols = c(scr_asn_sop, scr_asn_1sk), 
+               names_to = "sick_type", 
+               values_to = "Head_Count") %>% 
+  drop_na(Head_Count) 
+
+label_data_ca_rsk <- sum_p_rsk_sop_ca %>%
+  ungroup() %>% 
+  select(BID_PERIOD, trained_equipment, scr_asn_1sk) %>% 
+  drop_na(scr_asn_1sk) 
+
+label_data_ca_sop <- sum_p_rsk_sop_ca %>%
+  ungroup() %>% 
+  select(BID_PERIOD, trained_equipment, scr_asn_sop) %>% 
+  drop_na(scr_asn_sop) 
+
+
+ggplot() +
+  geom_bar(data = long_data_deg_ca, 
+           aes(x = BID_PERIOD, y = Head_Count, fill = sick_type), 
+           stat = "identity", position = "stack", width=20) +
+  facet_wrap(~ trained_equipment, scales = "free_y") +
+  scale_x_date(date_labels = "%Y-%m", date_breaks = "2 month") +
+  scale_fill_manual(values = c( 
+                                "scr_asn_sop" = "#413691", 
+                                "scr_asn_1sk" = "#D2058A")) +
+  labs(x = "Bid Period", y = "Primary Head Count", fill = "SCR Sick Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.text = element_text(size = 6),  # Adjust legend text size
+        legend.key.size = unit(0.25, "cm"),  # Adjust size of legend keys
+        legend.title = element_text(size = 5),  # Adjust legend title size
+        legend.box.spacing = unit(0.25, "cm")  # Adjust spacing around the legend box
+        ) +
+  ggtitle("SCR CA Head Count with ASN Code Proceeded by SOP/2SK Code") +
+  geom_text(data = label_data_ca_rsk,
+            aes(x = BID_PERIOD, y = scr_asn_1sk, label = scr_asn_1sk),
+            size = 1.9, vjust = -0.50, hjust = 0.5) +
+  geom_text(data = label_data_ca_sop,
+            aes(x = BID_PERIOD, y = scr_asn_sop, label = scr_asn_sop),
+            size = 1.9, vjust = -0.50, hjust = 0.5) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 5))
+  
+```
